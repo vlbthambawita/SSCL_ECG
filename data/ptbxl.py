@@ -13,121 +13,6 @@ from collections import Counter
 import pandas as pd
 
 
-
-
-class PTBXL_Backup(Dataset):
-    
-    def __init__(self, data_root, 
-                folds=[1,2,3,4,5,6,7,8,9,10], 
-                class_map = {"NORM":0, "MI":1, "STTC":2, "CD":3, "HYP":4},
-                sampling_rate = 500,
-                verbose=False,
-                transform=None
-                ):
-        
-            self.data_root = data_root
-            y = pd.read_csv(os.path.join(self.data_root, 'ptbxl_database.csv'), index_col='ecg_id')
-            self.folds = folds
-            self.class_map = class_map
-            self.sampling_rate = sampling_rate
-            self.verbose = verbose
-            self.transform = transform
-
-            y = y.loc[y.strat_fold.isin(self.folds)]
-
-             # Load scp_statements.csv for diagnostic aggregation
-            agg_df = pd.read_csv(os.path.join(data_root, "scp_statements.csv"), index_col=0)
-            self.agg_df = agg_df[agg_df.diagnostic == 1]
-
-            # Apply diagnostic superclass
-            y.scp_codes = y.scp_codes.apply(lambda x: ast.literal_eval(x))
-            y['diagnostic_superclass'] = y.scp_codes.apply(self.aggregate_diagnostic)
-
-            # Convert to Class numbers
-            y["class_ids"] = y.diagnostic_superclass.apply(self.map_class_num)
-
-            self.y = y
-
-            if self.verbose:
-                print("unique super classes=", self.agg_df.diagnostic_class.unique())
-                print("unique folds=",self.y.strat_fold.unique())
-                print(self.agg_df)
-                print(self.y.scp_codes)
-                print("Class labels=", self.y.diagnostic_superclass)
-                print("Class ids=", self.y.class_ids)
-
-    def aggregate_diagnostic(self, y_dic):
-        tmp = []
-        #print(y_dic)
-        for key in y_dic.keys():
-            if key in self.agg_df.index:
-                tmp.append(self.agg_df.loc[key].diagnostic_class)
-        print("temp =",  tmp)
-        return list(set(tmp))
-
-    def map_class_num(self, class_labels):
-        temp = []
-        try:
-            for l in class_labels:
-                class_id = self.class_map[l]
-                temp.append(class_id)
-        except:
-            print("These labels are wrong:", class_labels)
-        return temp
-
-    def read_row_data(self, data_path):
-        signal, meta = wfdb.rdsamp(data_path)
-        #data = np.array([signal for signal, meta in data])
-        if self.verbose:
-            print(signal)
-            print(meta)
-        return np.array(signal), meta
-        
-    
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, idx):
-
-        y_row = self.y.iloc[idx]
-        class_ids = y_row.class_ids
-
-        class_encoded = np.zeros(len(self.class_map))
-        class_encoded[class_ids] = 1
-
-        if self.verbose:
-            print(class_ids)
-            print(class_encoded)
-
-        # To get sample rate 100 ECGs
-        if self.sampling_rate == 100:
-            data_path = os.path.join(self.data_root, y_row.filename_lr)
-            ecg, meta = self.read_row_data(data_path)
-        # To get sample rate 500 ECGs
-        elif self.sampling_rate == 500:
-            data_path = os.path.join(self.data_root, y_row.filename_hr)
-            ecg, meta = self.read_row_data(data_path)
-
-        else:
-            print("Wrong sample rate")
-            exit
-
-        # Get transpose
-        #print(ecg.shape)
-        ecg = ecg.transpose()
-        #print(ecg.shape)
-        ecg = torch.from_numpy(ecg).to(torch.float32)
-        class_encoded = torch.from_numpy(class_encoded).to(torch.float32)
-
-        if self.transform: # Not in use
-            ecg = self.transform(ecg)
-        
-        #print("ecg_shape=", ecg.shape)
-        sample = {"ecg":ecg, "class":class_encoded }
-        return sample
-
-
-
 class PTBXL(Dataset):
     
     def __init__(self, data_root, 
@@ -229,7 +114,7 @@ class PTBXL(Dataset):
 
 
 
-class PTBXLDataModule(pl.LightningDataModule):
+class PTBXLDataModule_backup(pl.LightningDataModule):
     def __init__(self, root_dir, train_folds:list =[1,2,3,4,5], 
                 val_folds:list = [6,7,8], 
                 test_folds:list = [9, 10], 
@@ -272,6 +157,70 @@ class PTBXLDataModule(pl.LightningDataModule):
 
     def predict_dataloader(self):
         return DataLoader(self.ptbxl_predict, batch_size=self.bs)
+
+
+import pytorch_lightning as pl
+from torch.utils.data import DataLoader
+
+class PTBXLDataModule(pl.LightningDataModule):
+    def __init__(self, root_dir, 
+                 train_folds_cl=[1, 2],  # Contrastive learning folds
+                 train_folds_gt=[3, 4, 5],  # Ground task - training
+                 val_folds_gt=[6, 7],  # Ground task - validation
+                 test_folds_gt=[8, 9, 10],  # Ground task - testing
+                 sampling_rate=100,
+                 batch_size=32):
+        """
+        PTBXL DataModule for both contrastive learning and ground task classification.
+
+        Args:
+        - root_dir (str): Path to the PTBXL dataset.
+        - train_folds_cl (list): Folds used for contrastive learning.
+        - train_folds_gt (list): Folds used for ground task training.
+        - val_folds_gt (list): Folds used for ground task validation.
+        - test_folds_gt (list): Folds used for ground task testing.
+        - sampling_rate (int): ECG signal sampling rate (100 or 500 Hz).
+        - batch_size (int): Batch size for DataLoader.
+        """
+        super().__init__()
+
+        self.root_dir = root_dir
+        self.train_folds_cl = train_folds_cl
+        self.train_folds_gt = train_folds_gt
+        self.val_folds_gt = val_folds_gt
+        self.test_folds_gt = test_folds_gt
+        self.sampling_rate = sampling_rate
+        self.batch_size = batch_size
+
+        self.transform = None  # Can be set externally if needed
+
+    def prepare_data(self):
+        """Placeholder for any data preprocessing (e.g., downloading, cleaning)."""
+        pass
+
+    def setup(self, stage=None):
+        """Set up datasets for different training stages."""
+        if stage == "contrastive" or stage is None:
+            self.ptbxl_train_cl = PTBXL(self.root_dir, folds=self.train_folds_cl, transform=self.transform)
+
+        if stage == "fit" or stage is None:  # Multilabel classification setup
+            self.ptbxl_train_gt = PTBXL(self.root_dir, folds=self.train_folds_gt, transform=self.transform)
+            self.ptbxl_val_gt = PTBXL(self.root_dir, folds=self.val_folds_gt, transform=self.transform)
+
+        if stage == "test" or stage is None:
+            self.ptbxl_test_gt = PTBXL(self.root_dir, folds=self.test_folds_gt, transform=self.transform)
+
+    def train_dataloader(self, task="ground"):
+        """Returns the appropriate training dataloader based on task type."""
+        if task == "contrastive":
+            return DataLoader(self.ptbxl_train_cl, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(self.ptbxl_train_gt, batch_size=self.batch_size, shuffle=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.ptbxl_val_gt, batch_size=self.batch_size)
+
+    def test_dataloader(self):
+        return DataLoader(self.ptbxl_test_gt, batch_size=self.batch_size)
 
 
 
